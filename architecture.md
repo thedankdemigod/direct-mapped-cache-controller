@@ -293,7 +293,13 @@ Transaction 2 -> byte 2
 Transaction 3 -> byte 3
 ```
 
-The exact latency `N` is still an open parameter.
+The memory latency is a single fixed parameter applied identically to every memory transaction, read or write.
+
+```text
+MEM_LATENCY = 3   // default
+```
+
+`MEM_LATENCY` is exposed as a parameter so the testbench can sweep different latency values without changing the cache-controller RTL. The controller must therefore wait for `mem_valid` rather than rely on a hardcoded latency.
 
 ## 11. Design invariant
 
@@ -311,15 +317,24 @@ A cache line is never made valid until all four bytes are available and the comp
 
 ---
 
-The architectural core, in one line: **direct-mapped, 8-line x 4-byte cache, byte-addressable, write-through + write-allocate, byte-at-a-time memory interface, temporary 4-byte miss buffer, atomic line commit, read/write priority rule on both CPU and memory interfaces, and write-miss ordering of FETCH → MERGE → CACHE COMMIT → MEMORY WRITE → COMPLETE.**
+The architectural core, in one line: **direct-mapped, 8-line x 4-byte cache, byte-addressable, write-through + write-allocate, byte-at-a-time memory interface, temporary 4-byte miss buffer, atomic line commit, read/write priority rule on both CPU and memory interfaces, memory requests held until `mem_valid`, parameterized fixed memory latency (`MEM_LATENCY = 3` by default), no `mem_ready`, and write-miss ordering of FETCH → MERGE → CACHE COMMIT → MEMORY WRITE → COMPLETE.**
 
 ## 13. What's left before this becomes an FSM
 
-- Exact memory latency `N`
-- Memory request protocol details — exact meaning/timing of `cache_m_req`, when memory samples it, when `mem_valid` returns
-- Whether memory needs backpressure/acceptance signaling, or always accepts instantly
+- Exact cycle-by-cycle timing diagrams
 - Exact write-through timing for write hit (parallel vs. sequential with the cache-array update)
 - Reset behavior
-- Full cycle-by-cycle timing diagrams
 - FSM structure
 - Exact RTL representation of cache storage
+
+### Locked memory-interface decisions
+
+- `cache_m_req` is held high for the full memory transaction, from request issue until `mem_valid`.
+- `MEM_LATENCY` is a parameter rather than a hardcoded controller assumption.
+- Default `MEM_LATENCY = 3`.
+- The same fixed latency applies to both read and write transactions.
+- The testbench should be able to sweep `MEM_LATENCY` values to verify that the controller depends on `mem_valid` for completion rather than a hardcoded wait count.
+- No `mem_ready` signal is used in v1.
+- There is no separate memory acceptance phase.
+- The original stability contract remains: memory address/control/write-data remain stable until `mem_valid`.
+
