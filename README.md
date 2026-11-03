@@ -1,10 +1,10 @@
 # Cache Controller
 
-A Verilog/SystemVerilog implementation of a direct-mapped cache controller, built and verified in simulation (Vivado/xsim), with an emphasis on a rigorous, self-checking testbench over architectural complexity.
+A SystemVerilog implementation of a direct-mapped cache controller, built and verified in simulation (Vivado/xsim), with an emphasis on a rigorous, self-checking testbench over architectural complexity.
 
 ## Project Status
 
-🚧 In development — Stage 1 (architecture & specification) complete. See `docs/architecture.md` for the full frozen spec.
+🚧 In development — architecture, FSM and datapath design are complete. RTL implementation is next.
 
 ## Specification
 
@@ -31,23 +31,29 @@ A Verilog/SystemVerilog implementation of a direct-mapped cache controller, buil
 
 ## Architecture Highlights
 
-- CPU interface: simple `req`/`ready`/`valid` handshake, one outstanding transaction at a time, no request queue or cancellation.
+- CPU interface: a simple `req` / `ready` / `valid` handshake, one outstanding transaction at a time, no request queue or cancellation.
+- Registered completion: `cache_valid` appears in the first `IDLE` cycle after the work finishes, so the cache can accept the next request in that same cycle.
 - Memory interface: byte-at-a-time, with continuous-request bursts for 4-byte line fills (no idle gap between bytes in a fetch).
 - Memory model: variable random latency (2–8 cycles) per byte transaction, to verify the controller genuinely waits on completion rather than assuming a fixed delay.
-- Miss handling: block-aligned fetch into a temporary buffer, single atomic commit to the cache array (never a partially-filled valid line).
-- Write-miss: fetch → merge CPU write into the buffer → atomic commit → write-through the modified byte to memory.
-- Full synchronous reset (valid/tag/data arrays and FSM state all cleared in one cycle).
+- Miss handling: block-aligned fetch into a temporary buffer, then a single atomic commit to the cache array (never a partially-filled valid line).
+- Write miss: fetch, merge the CPU write into the buffer, atomic commit, then write-through of the modified byte to memory.
+- Controller FSM: five states (`IDLE`, `LOOKUP`, `FETCH`, `COMMIT`, `WRITE_MEM`).
+- Full synchronous reset (valid, tag and data arrays and the FSM state all cleared in one cycle).
 
-Full details, worked examples, and cycle-by-cycle timing diagrams: [`docs/architecture.md`](docs/architecture.md).
+## Documentation
+
+- [`docs/architecture.md`](docs/architecture.md): behavior, interfaces, timing and worked examples
+- [`docs/fsm_design.md`](docs/fsm_design.md): states, transitions, per-state outputs and verification targets
+- [`docs/datapath_design.md`](docs/datapath_design.md): registers, arrays, write controls, muxes and the memory model
 
 ## Planned Work
 
 - [x] Define interfaces (CPU ↔ cache, cache ↔ memory)
 - [x] Finalize architecture / timing specification
-- [ ] Design controller FSM
+- [x] Design controller FSM
+- [x] Design datapath and storage
 - [ ] Implement memory model
-- [ ] Implement cache storage
-- [ ] Implement controller
+- [ ] Implement controller (cache storage included)
 - [ ] Build testbench
 - [ ] Verify functionality
 - [ ] Synthesize RTL
@@ -57,12 +63,12 @@ Full details, worked examples, and cycle-by-cycle timing diagrams: [`docs/archit
 
 ```
 rtl/    - synthesizable RTL
-tb/     - testbenches
+tb/     - testbenches and the simulation memory model
 sim/    - simulation scripts/outputs
-docs/   - architecture spec and design notes
+docs/   - architecture, FSM and datapath design documents
 ```
 
 ## Tools
 
 - Vivado / xsim for simulation
-- No FPGA hardware or synthesis-to-board required — this project is simulation-only
+- No FPGA hardware is required — this project is simulation-only

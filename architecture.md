@@ -1,6 +1,6 @@
 # Cache Controller v1 — Architecture
 
-This is the frozen architecture-level spec for v1. It stays at the architecture/spec level — no FSM states, no RTL yet. Those come next.
+This is the frozen architecture-level spec for v1. It defines what the cache does and how it talks to the CPU and to memory. The controller FSM and the datapath are specified in [`fsm_design.md`](fsm_design.md) and [`datapath_design.md`](datapath_design.md).
 
 ## 1. System overview
 
@@ -96,7 +96,12 @@ A request is accepted when `cpu_req && cache_ready`. Once `cpu_req` is asserted,
 
 Only one CPU transaction can be outstanding at a time. No request queue, no request IDs, no cancellation.
 
-If `cpu_read` and `cpu_write` are ever asserted together, this is resolved by a hardware priority rule rather than left undefined or assumed away by the testbench.
+**Edge cases.** Two input combinations are not meaningful requests, and the hardware still defines what happens so behavior is never undefined:
+
+- `cpu_read` and `cpu_write` both high: write wins (hardware priority rule).
+- `cpu_req` high with neither `cpu_read` nor `cpu_write`: the request is accepted and treated as a read.
+
+The testbench never generates either case.
 
 ## 4. Cache ready / completion
 
@@ -104,33 +109,32 @@ If `cpu_read` and `cpu_write` are ever asserted together, this is resolved by a 
 cache_ready = (FSM state == IDLE)
 ```
 
-`cache_valid` pulses for one cycle to indicate the accepted transaction has completed.
+`cache_valid` is a registered output. It is high for exactly one cycle, and that cycle is the first `IDLE` cycle after the transaction's work finishes. For reads, `cache_rdata` is registered on the same edge and is valid in that same cycle. For writes, `cache_rdata` is ignored.
 
-Read: `cache_valid = 1`, `cache_rdata` = returned byte.
-Write: `cache_valid = 1`, `cache_rdata` ignored.
+Because `cache_ready` is high in `IDLE`, the completion cycle is also a cycle in which the cache can accept the next request. That is the back-to-back handoff: no mandatory idle gap between transactions.
 
-Hit/miss is never exposed to the CPU — only the completion latency differs. Back-to-back requests are allowed with no mandatory idle gap between them.
+```text
+cycle:         0 (IDLE)   1 (LOOKUP)   2 (IDLE)
+cpu_req:       1          -            1   <- next request presented
+cache_ready:   1          0            1   <- and accepted here
+cache_valid:   0          0            1
+cache_rdata:   -          -            D
+```
+
+Hit/miss is never exposed to the CPU — only the completion latency differs.
 
 ## 5. Read hit
 
 ```text
-CPU request
-     |
-Extract TAG / INDEX / OFFSET
-     |
-Select cache[index]
-     |
-valid == 1 ?
-     |
-Compare stored tag with CPU tag
-     |
-      HIT
-       |
-Select data[offset]
-       |
-cache_rdata
-       |
-cache_valid
+IDLE:    accept request, register address
+   |
+LOOKUP:  index selects the line
+         valid == 1 ?  stored tag == CPU tag ?
+   |
+  HIT:   data[offset] is registered into cache_rdata,
+         cache_valid is registered, FSM returns to IDLE
+   |
+IDLE:    cache_valid = 1, cache_rdata = byte
 ```
 
 Worked example — `address = 0x34` (`0011_0100`):
@@ -141,7 +145,7 @@ INDEX  = 101
 OFFSET = 00
 ```
 
-The offset selects byte 0 of the selected cache line.
+The offset selects byte 0 of the selected cache line. A read hit takes 2 cycles from the acceptance cycle to the cycle where `cache_valid` is high.
 
 ## 6. Read miss
 
@@ -158,7 +162,7 @@ READ 0x36 -> temp_buffer[2]
 READ 0x37 -> temp_buffer[3]
 ```
 
-**Step 3 — atomic cache commit.** Only once all four bytes have arrived:
+**Step 3 — atomic cache commit.** The `COMMIT` state is its own cycle, entered only after all four bytes have arrived:
 
 ```text
 cache[index].data[0..3] <= temp_buffer[0..3]
@@ -168,24 +172,25 @@ cache[index].valid      <= 1
 
 One cache-line commit, not four independent writes.
 
-**Step 4 — return byte:** `cache_rdata = temp_buffer[cpu_offset]`, then `cache_valid = 1`.
+**Step 4 — response.** On the `COMMIT -> IDLE` edge, `cache_rdata` is registered from `temp_buffer[cpu_offset]` and `cache_valid` is registered. Both are visible in the following `IDLE` cycle.
 
 ## 7. Write hit
 
-Cache-array update and the write-through push to memory are issued **in the same cycle** (parallel, not sequential):
+The cache-array byte update happens exactly once, in the `LOOKUP` cycle, and lands on the same clock edge that enters `WRITE_MEM`. `cache_m_req` is high from the first `WRITE_MEM` cycle, so the array update and the memory write-through start together.
 
 ```text
 CPU WRITE (hit)
    |
-   |-- cache[index].data[offset] <= cpu_wdata     (same cycle, instant)
-   |-- cache_m_req/write issued to memory          (same cycle)
+LOOKUP:     tag matches
+            cache[index].data[offset] <= cpu_wdata   (once)
    |
-... wait for mem_valid ...
+WRITE_MEM:  cache_m_req/write issued to memory
+            ... wait for mem_valid ...
    |
-cache_valid = 1
+IDLE:       cache_valid = 1  (registered one cycle after mem_valid)
 ```
 
-The cache-array write completes instantly (internal, no handshake) and is never the bottleneck — the memory write's variable latency is. `cache_valid` fires only once `mem_valid` confirms the memory write has completed; a write is not "done" until both cache and memory are updated. Memory receives only the modified byte, never the whole line.
+A write is not complete until both the cache and memory are updated. Memory receives only the modified byte, never the whole line. `WRITE_MEM` never touches the cache array.
 
 ## 8. Write miss
 
@@ -197,15 +202,15 @@ FETCH -> MERGE -> CACHE COMMIT -> MEMORY WRITE -> COMPLETE
 
 **Step 1 — fetch** the entire block into `temp_buffer`, identical mechanism to a read miss (same burst, see §10) — the fetch step itself does not distinguish between a read-miss or write-miss caller.
 
-**Step 2 — merge:** `temp_buffer[cpu_offset] = cpu_wdata`.
+**Step 2 — merge.** When the byte at the CPU's offset arrives, the CPU's data is stored in the buffer instead of the byte memory returned: `temp_buffer[cpu_offset] = cpu_wdata`.
 
 Example — `address = 0x36`, `wdata = 0xAA`, fetched block `11 22 33 44` -> after merge: `11 22 AA 44`.
 
 **Step 3 — atomic cache commit** of the already-merged line (same mechanism as §6 Step 3) — the cache array is written exactly once, and it's already correct.
 
-**Step 4 — write-through:** send only the modified byte to memory (`address = cpu_addr`, `data = cpu_wdata`). The other three bytes aren't rewritten — memory already has them.
+**Step 4 — write-through.** `cache_m_req` drops in `COMMIT` and re-rises in `WRITE_MEM` as a fresh single-byte transaction (`address = cpu_addr`, `data = cpu_wdata`). The other three bytes aren't rewritten — memory already has them.
 
-**Step 5 — complete:** `cache_valid = 1` only after the memory write finishes.
+**Step 5 — complete.** After the memory write finishes, `cache_valid` is registered and appears in the next `IDLE` cycle.
 
 ```text
 CPU write miss
@@ -214,16 +219,16 @@ CPU write miss
 Fetch 4 bytes (burst, §10)
       |
       v
-Modify temporary buffer
+Merge CPU byte into temp buffer
       |
       v
-Commit complete cache line
+COMMIT: write complete cache line
       |
       v
-Write modified byte to memory
+WRITE_MEM: write modified byte to memory
       |
       v
-cache_valid
+IDLE: cache_valid
 ```
 
 ## 9. Cache <-> memory interface
@@ -251,7 +256,7 @@ Address/control/data are held stable for the duration of a single-byte transacti
 
 `mem_rdata` is valid only in the exact cycle `mem_valid` is high; don't-care otherwise. The cache must register `mem_rdata` into the temp buffer on that exact clock edge — the data is not retained on the wire afterward, only in whatever register the cache captures it into. Symmetrically, memory must commit `cache_m_wdata` into its storage on the exact cycle it raises `mem_valid` for a write.
 
-If `cache_m_read` and `cache_m_write` are ever asserted together, this is resolved by the same hardware priority rule as the CPU side — not assumed away.
+`cache_m_read` and `cache_m_write` are never both high. The controller's output decode drives `cache_m_read` only in `FETCH` and `cache_m_write` only in `WRITE_MEM`, so the case cannot occur.
 
 No `mem_ready` signal is used in v1. Memory always accepts a request instantly; there is no separate acceptance phase, since memory is a dedicated single-consumer resource with no contention in this design.
 
@@ -275,11 +280,11 @@ mem_valid:       0      0      1      0
 
 **Multi-byte burst (4-byte block fill, used identically by read-miss and write-miss fetch):**
 
-`cache_m_req` stays **continuously high for the entire burst**, only dropping after the *last* byte's `mem_valid`. A **change in `cache_m_addr`** — not a `cache_m_req` toggle — signals the start of each new byte-transaction within the burst; memory must detect the address change the cycle after its own `mem_valid` and begin a fresh random-delay countdown for that new address. This gives zero idle cycles between bytes within a burst (Design 2), as opposed to toggling `cache_m_req` per byte, which would force a mandatory 1-cycle gap between every byte (Design 1, rejected).
+`cache_m_req` stays **continuously high for the entire burst**, only dropping after the *last* byte's `mem_valid`. A **change in `cache_m_addr`** — not a `cache_m_req` toggle — signals the start of each new byte-transaction within the burst; memory must detect the address change the cycle after its own `mem_valid` and begin a fresh random-delay countdown for that new address. This gives zero idle cycles between bytes within a burst, as opposed to toggling `cache_m_req` per byte, which would force a mandatory 1-cycle gap between every byte.
 
-**Explicit non-retrigger rule:** while `cache_m_req` is high and `cache_m_addr` is unchanged from the previous cycle, memory must treat this as the *same* transaction still in progress — it must not restart its random-delay countdown or reinterpret it as a new request. A new countdown starts only on the specific cycle the address changes (or on the very first cycle of the burst). This matters concretely: in the diagram below, address `34` is held for 3 consecutive cycles before `mem_valid` fires — memory must count through all 3 as one transaction, not three.
+**Non-retrigger rule:** while `cache_m_req` is high and `cache_m_addr` is unchanged from the previous cycle, memory must treat this as the *same* transaction still in progress — it must not restart its random-delay countdown or reinterpret it as a new request. A new countdown starts only on the specific cycle the address changes (or on the very first cycle of the burst). In the diagram below, address `34` is held for 3 consecutive cycles before `mem_valid` fires — memory counts through all 3 as one transaction, not three.
 
-**Address-change timing, stated precisely:** if byte K's `mem_valid` fires on cycle N, then byte K+1's address appears on `cache_m_addr` on cycle N+1, and its random-delay countdown begins counting from cycle N+1. The cache's next-address logic must have that address ready to present on cycle N+1 — it cannot be computed reactively after N+1 has already passed.
+**Address-change timing:** if byte K's `mem_valid` fires on cycle N, then byte K+1's address appears on `cache_m_addr` on cycle N+1, and its random-delay countdown begins counting from cycle N+1. The cache's next-address logic must have that address ready to present on cycle N+1 — it cannot be computed reactively after N+1 has already passed.
 
 ```text
 cycle:          0    1    2    3    4    5    6    7    8    9    10   11   12
@@ -289,8 +294,6 @@ mem_valid:      0    0    1    0    0    1    0    0    1    0    0    1    0
 mem_rdata:      -    -    D34  -    -    D35  -    -    D36  -    -    D37  -
 ```
 (shown with a delay of 2 per byte, for illustration — actual per-byte delay is random 2-8, independently drawn)
-
-The cache's next-address logic must be ready to present the next byte's address on the cycle immediately following the prior byte's `mem_valid` — this is a real sequencing requirement on the FSM/datapath, not automatic.
 
 ## 11. Design invariant
 
@@ -304,27 +307,29 @@ Synchronous reset, single cycle. On the reset edge, the following clear/initiali
 - All 8 tag fields -> 0
 - All 8 data lines (32 bytes total) -> 0
 - FSM state -> `IDLE`
+- `cache_valid` register -> 0, burst counter -> 0
 
-Tags and data are not functionally required to reset (they're unreachable while valid=0), but are cleared anyway for simulation cleanliness — avoiding X-propagation in waveforms, and allowing simple, complete-state self-checking testbench assertions immediately after reset. The hardware cost of clearing the full arrays is negligible at this scale.
+Tags and data are not functionally required to reset (they're unreachable while valid=0), but are cleared anyway for simulation cleanliness — avoiding X-propagation in waveforms, and allowing simple, complete-state self-checking testbench assertions immediately after reset.
 
 `cache_ready` is correctly high (FSM = IDLE) from the first cycle after reset. The temp buffer is left don't-care at reset, since no transaction can be mid-flight the instant reset ends.
 
+In simulation, the memory model's delay countdown is reset together with the cache. Otherwise a reset in the middle of a transaction could leave a stale `mem_valid` pulse or a late memory write arriving after reset.
+
 ## 13. Transaction summaries
 
-**Read hit:** REQUEST -> LOOKUP -> HIT -> RETURN BYTE -> cache_valid
+**Read hit:** IDLE -> LOOKUP -> IDLE (cache_valid)
 
-**Read miss:** REQUEST -> LOOKUP -> MISS -> FETCH 4 BYTES (burst) -> CACHE COMMIT -> RETURN BYTE -> cache_valid
+**Read miss:** IDLE -> LOOKUP -> FETCH (4-byte burst) -> COMMIT -> IDLE (cache_valid)
 
-**Write hit:** REQUEST -> LOOKUP -> HIT -> UPDATE CACHE + WRITE MEMORY (parallel) -> cache_valid
+**Write hit:** IDLE -> LOOKUP (array byte write) -> WRITE_MEM -> IDLE (cache_valid)
 
-**Write miss:** REQUEST -> LOOKUP -> MISS -> FETCH 4 BYTES (burst) -> MERGE CPU WRITE -> CACHE COMMIT -> WRITE MODIFIED BYTE TO MEMORY -> cache_valid
+**Write miss:** IDLE -> LOOKUP -> FETCH (burst, merge) -> COMMIT -> WRITE_MEM -> IDLE (cache_valid)
 
 ---
 
-The architectural core, in one line: **direct-mapped, 8-line x 4-byte cache, byte-addressable, write-through + write-allocate, byte-at-a-time memory interface with continuous-request bursts for line fills (Design 2), temporary 4-byte miss buffer, atomic line commit, read/write priority rule on both CPU and memory interfaces, variable random memory latency (2-8 cycles per byte), parallel write-hit update, full synchronous reset, and write-miss ordering of FETCH -> MERGE -> CACHE COMMIT -> MEMORY WRITE -> COMPLETE.**
+The architectural core, in one line: **direct-mapped, 8-line x 4-byte cache, byte-addressable, write-through + write-allocate, byte-at-a-time memory interface with continuous-request bursts for line fills, temporary 4-byte miss buffer, atomic line commit, registered completion with same-cycle back-to-back acceptance, defined behavior for the read/write edge cases, variable random memory latency (2-8 cycles per byte), single array write per write hit, full synchronous reset, and write-miss ordering of FETCH -> MERGE -> CACHE COMMIT -> MEMORY WRITE -> COMPLETE.**
 
-## 14. What's left before this becomes an FSM
+## 14. Where the rest of the design lives
 
-- Full cycle-by-cycle timing diagrams have been drawn for the individual transaction types (§6, §7, §8, §10); the FSM stage should now formalize these into actual states and transitions
-- FSM structure
-- Exact RTL representation of cache storage (register array vs. other structures, port count)
+- [`fsm_design.md`](fsm_design.md): the five states, transitions, per-state outputs and timing.
+- [`datapath_design.md`](datapath_design.md): registers, arrays, write controls, muxes and the memory model.
