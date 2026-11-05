@@ -25,7 +25,10 @@ module cache_controller (
     // CPU -> cache
     input  logic       cpu_req,
     input  logic [7:0] cpu_addr,
-    input  logic       cpu_read,
+    /* verilator lint_off UNUSEDSIGNAL */
+    input  logic       cpu_read,       // intentionally unused: write wins if both set,
+                                       // and neither set is treated as a read
+    /* verilator lint_on UNUSEDSIGNAL */
     input  logic       cpu_write,
     input  logic [7:0] cpu_wdata,
 
@@ -131,7 +134,8 @@ module cache_controller (
 
             COMMIT: begin
                 array_line_we = 1'b1;
-                next_state    = req_is_write ? WRITE_MEM : IDLE;
+                if (req_is_write) next_state = WRITE_MEM;
+                else              next_state = IDLE;
             end
 
             WRITE_MEM: begin
