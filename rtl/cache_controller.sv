@@ -23,14 +23,14 @@ module cache_controller (
     input  logic       rst,            // synchronous, active high
 
     // CPU -> cache
-    input  logic       cpu_req,
-    input  logic [7:0] cpu_addr,
+    input  logic       cpu_req,         //cpu has request
+    input  logic [7:0] cpu_addr,        //addr 
     /* verilator lint_off UNUSEDSIGNAL */
     input  logic       cpu_read,       // intentionally unused: write wins if both set,
                                        // and neither set is treated as a read
     /* verilator lint_on UNUSEDSIGNAL */
-    input  logic       cpu_write,
-    input  logic [7:0] cpu_wdata,
+    input  logic       cpu_write,       //req is write
+    input  logic [7:0] cpu_wdata,       //data to write
 
     // cache -> CPU
     output logic       cache_ready,
@@ -50,42 +50,42 @@ module cache_controller (
 );
 
     // -------------------------------------------------------------------------
-    // 1. State encoding
+    // 1. State encoding    //enumerated data type state_t to represent all states in the FSM
     // -------------------------------------------------------------------------
-    typedef enum logic [2:0] {
+    typedef enum logic [2:0] {      
         IDLE      = 3'd0,
         LOOKUP    = 3'd1,
         FETCH     = 3'd2,
         COMMIT    = 3'd3,
         WRITE_MEM = 3'd4
     } state_t;
-
+ 
     // -------------------------------------------------------------------------
     // 2. Declarations
     // -------------------------------------------------------------------------
     state_t       state, next_state;
 
-    // Retained request (loaded on IDLE -> LOOKUP)
+    // Retained request (loaded on IDLE -> LOOKUP)  //retains req_addr, read/write, write data in write case
     logic [7:0]   req_addr;
     logic         req_is_write;
     logic [7:0]   req_wdata;
 
     // Burst counter and line buffer
-    logic [1:0]   cnt;
-    logic [7:0]   temp_buffer [0:3];
+    logic [1:0]   cnt;                  //counts bytes fetched (0 to 3)
+    logic [7:0]   temp_buffer [0:3];    //stores fetched byte(s), 0 through 3
 
     // Registered response
-    logic         cache_valid_r;
-    logic [7:0]   cache_rdata_r;
+    logic         cache_valid_r;        //cache_valid retained from cache_controller side
+    logic [7:0]   cache_rdata_r;        //read data delievered to CPU Retained from cache_controller side
 
     // Storage arrays
-    logic         valid_arr [0:7];
-    logic [2:0]   tag_arr   [0:7];
-    logic [7:0]   data_arr  [0:7][0:3];
+    logic         valid_arr [0:7];      //cache line validity 
+    logic [2:0]   tag_arr   [0:7];      //tag from addr
+    logic [7:0]   data_arr  [0:7][0:3]; //data
 
     // Array write controls
-    logic         array_byte_we;
-    logic         array_line_we;
+    logic         array_byte_we;    //enables write to one byte in cache_line;write hit
+    logic         array_line_we;    //enables write to entire cache line;cache miss
 
     // -------------------------------------------------------------------------
     // 3. Derived fields
